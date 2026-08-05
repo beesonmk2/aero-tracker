@@ -29,4 +29,5 @@ jobs:
           git config user.email "actions@users.noreply.github.com"
           git add aerodrome_history.csv
           git diff --cached --quiet || git commit -m "Snapshot $(date -u +'%Y-%m-%d %H:%M') UTC"
+          git pull --rebase --autostash
           git push
