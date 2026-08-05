@@ -1,0 +1,32 @@
+name: Aerodrome hourly snapshot
+
+on:
+  schedule:
+    - cron: "7 * * * *"   # every hour, at 7 minutes past
+  workflow_dispatch:       # adds a manual "Run workflow" button for testing
+
+permissions:
+  contents: write
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get the repository files
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run the tracker
+        run: python aerodrome_tracker.py
+
+      - name: Save the updated history file
+        run: |
+          git config user.name "aero-snapshot-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add aerodrome_history.csv
+          git diff --cached --quiet || git commit -m "Snapshot $(date -u +'%Y-%m-%d %H:%M') UTC"
+          git push
