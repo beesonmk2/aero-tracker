@@ -1,6 +1,10 @@
 """
-Aerodrome On-Chain Collector — v1
----------------------------------
+Aerodrome On-Chain Collector — v1.1
+-----------------------------------
+Change from v1: RPC endpoints reordered by observed reliability
+(publicnode carried the entire first sweep; mainnet.base.org rejected
+most calls, so it is now the last resort instead of the first try).
+
 Reads ground-truth allocation data directly from Base's blockchain via
 Aerodrome's official "Sugar" helper contracts (addresses from the official
 velodrome-finance/sugar deployment file):
@@ -38,11 +42,13 @@ LP_SUGAR = "0x69dD9db6d8f8E7d83887A704f447b1a584b599A1"
 REWARDS_SUGAR = "0x1b121EfDaF4ABb8785a315C51D29BCE0552A7678"
 
 # Free public Base RPC endpoints, tried in order per call
+# Ordered by observed reliability (first run: mainnet.base.org rejected
+# most calls, publicnode carried the sweep - so publicnode leads now)
 RPC_ENDPOINTS = [
-    "https://mainnet.base.org",
     "https://base-rpc.publicnode.com",
     "https://base.llamarpc.com",
     "https://1rpc.io/base",
+    "https://mainnet.base.org",
 ]
 
 EPOCH_PAGE = 100          # pools per epochsLatest call

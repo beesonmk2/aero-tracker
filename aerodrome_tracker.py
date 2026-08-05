@@ -1,6 +1,13 @@
 """
-Aerodrome Pool Tracker — v3
+Aerodrome Pool Tracker — v4
 ---------------------------
+Changes from v3:
+  * Closes the "join gap": after the volume sweep, reads the gauged-pool
+    list from onchain_history.csv (written by the on-chain collector) and
+    fetches market data for any gauged pool the sweep missed, via the
+    provider's address-based lookup. Long-tail gauged pools can no longer
+    hide below the volume rankings.
+
 Changes from v2:
   * No more guessing catalog names: the script now asks the data provider
     for its live list of exchanges on Base and tracks EVERY one whose name
@@ -27,6 +34,9 @@ from datetime import datetime, timezone
 FALLBACK_DEX_IDS = ["aerodrome", "aerodrome-slipstream"]  # used only if discovery fails
 PAGES_PER_DEX = 6
 NEW_POOL_PAGES = 2
+ONCHAIN_FILE = "onchain_history.csv"   # written by the on-chain collector
+BACKFILL_BATCH = 30        # provider allows up to 30 addresses per lookup
+BACKFILL_MAX_CALLS = 20    # safety cap (30*20 = 600 backfilled pools max)
 NETWORK = "base"
 HISTORY_FILE = "aerodrome_history.csv"
 BACKUP_FILE = "aerodrome_history_v1_backup.csv"
@@ -171,7 +181,7 @@ def collect_pools():
                 p = parse_pool(item, source="top_pools")
                 if p["pool_address"]:
                     p["dex"] = dex_id
-                    pools[p["pool_address"]] = p
+                    pools[p["pool_address"].lower()] = p
                     count += 1
             dex_total += count
             print(f"  {dex_id} page {page}: {count} pools")
@@ -200,7 +210,60 @@ def collect_pools():
 
     print()
     print("FETCH REPORT -> " + " | ".join(report))
+    # 4) Join-gap backfill: fetch any gauged pool the volume sweep missed.
+    gauged = load_latest_gauged_addresses()
+    missing = [a for a in gauged if a not in pools]
+    if gauged:
+        print(f"  gauged pools known: {len(gauged)}, "
+              f"missed by volume sweep: {len(missing)}")
+    filled = 0
+    calls = 0
+    for i in range(0, len(missing), BACKFILL_BATCH):
+        if calls >= BACKFILL_MAX_CALLS:
+            print(f"  backfill call cap reached ({BACKFILL_MAX_CALLS}) - "
+                  f"{len(missing) - i} pools left for next run")
+            break
+        batch = missing[i:i + BACKFILL_BATCH]
+        url = (f"https://api.geckoterminal.com/api/v2/networks/{NETWORK}"
+               f"/pools/multi/{'%2C'.join(batch)}")
+        data = fetch_json(url)
+        calls += 1
+        time.sleep(PAUSE_BETWEEN_CALLS)
+        if not data or not data.get("data"):
+            continue
+        for item in data["data"]:
+            p = parse_pool(item, source="gauged_backfill")
+            if p["pool_address"]:
+                p["dex"] = dex_of(item) or "aerodrome-gauged"
+                pools[p["pool_address"].lower()] = p
+                filled += 1
+    if gauged:
+        print(f"  backfilled market data for {filled} gauged pools "
+              f"({calls} lookup calls)")
+
     return list(pools.values())
+
+
+def load_latest_gauged_addresses():
+    """Read the newest snapshot's pool addresses from the on-chain CSV."""
+    folder = os.path.dirname(os.path.abspath(__file__))
+    path = os.path.join(folder, ONCHAIN_FILE)
+    if not os.path.exists(path):
+        print("  (no onchain_history.csv yet - skipping gauged backfill)")
+        return []
+    try:
+        latest, addrs = "", []
+        with open(path, newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                ts = row.get("snapshot_utc", "")
+                if ts > latest:
+                    latest, addrs = ts, []
+                if ts == latest and row.get("pool_address"):
+                    addrs.append(row["pool_address"].lower())
+        return addrs
+    except Exception as e:
+        print(f"  (could not read {ONCHAIN_FILE}: {e} - skipping backfill)")
+        return []
 
 
 def archive_old_format_if_needed(path, folder):
