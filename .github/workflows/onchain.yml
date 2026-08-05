@@ -1,0 +1,36 @@
+name: Aerodrome onchain snapshot
+
+on:
+  schedule:
+    - cron: "37 * * * *"   # every hour, at 37 minutes past (offset from the market tracker)
+  workflow_dispatch:        # manual "Run workflow" button for testing
+
+permissions:
+  contents: write
+
+jobs:
+  onchain:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get the repository files
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install blockchain libraries
+        run: pip install eth-abi eth-utils "eth-hash[pycryptodome]"
+
+      - name: Run the on-chain collector
+        run: python onchain_collector.py
+
+      - name: Save the updated history file
+        run: |
+          git config user.name "aero-snapshot-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add onchain_history.csv
+          git diff --cached --quiet || git commit -m "Onchain $(date -u +'%Y-%m-%d %H:%M') UTC"
+          git pull --rebase --autostash
+          git push
