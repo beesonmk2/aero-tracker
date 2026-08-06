@@ -1,6 +1,12 @@
 """
-Aerodrome On-Chain Collector — v1.1
+Aerodrome On-Chain Collector — v1.2
 -----------------------------------
+Change from v1.1: reward tokens are now recorded as "SYMBOL@0xaddress"
+instead of bare symbols, so the analysis layer can price EVERY reward
+token (long-tail included) via address lookups instead of guessing from
+ambiguous symbols. Fees/bribes JSON example:
+  {"USDC@0x833589fcd6edb6e08f4c7c32d4f71b54bda02913": 1234.56}
+
 Change from v1: RPC endpoints reordered by observed reliability
 (publicnode carried the entire first sweep; mainnet.base.org rejected
 most calls, so it is now the last resort instead of the first try).
@@ -145,12 +151,13 @@ def token_meta(address):
 
 
 def rewards_to_json(reward_list):
-    """[(token, raw_amount), ...] -> compact JSON like {"USDC": 1234.56}."""
+    """[(token, raw)] -> JSON {"SYM@0xaddr": amt} so every token is priceable."""
     out = {}
     for token, amount in reward_list:
         symbol, decimals = token_meta(token)
+        key = f"{symbol}@{token.lower()}"
         human = amount / (10 ** decimals)
-        out[symbol] = round(out.get(symbol, 0) + human, 6)
+        out[key] = round(out.get(key, 0) + human, 6)
     return json.dumps(out, separators=(",", ":")) if out else "{}"
 
 

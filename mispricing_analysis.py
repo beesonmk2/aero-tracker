@@ -1,6 +1,10 @@
 """
-Aerodrome Mispricing Analysis — Stage 1
----------------------------------------
+Aerodrome Mispricing Analysis — Stage 1 (v1.1)
+----------------------------------------------
+v1.1: prices EVERY reward token by on-chain address (batched lookups),
+ranks the headline table by excess dollars instead of raw ratio, and
+summarizes unpriced leftovers instead of listing hundreds of tokens.
+
 The research instrument. On each run it:
   1. Loads the LATEST snapshot from onchain_history.csv (votes, emissions,
      epoch fee rewards) and aerodrome_history.csv (volume, TVL, names)
@@ -74,37 +78,63 @@ def load_latest_snapshots(path, n=2):
     return {ts: by_ts[ts] for ts in ordered[-n:]}
 
 
-def fetch_token_prices():
-    """One GeckoTerminal call for all known reward-token prices."""
-    addrs = list(TOKEN_ADDRESSES.values())
-    url = ("https://api.geckoterminal.com/api/v2/simple/networks/base/"
-           "token_price/" + "%2C".join(addrs))
-    try:
-        req = urllib.request.Request(url, headers=HEADERS)
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = json.loads(resp.read().decode())
-        raw = data["data"]["attributes"]["token_prices"]
-        by_addr = {k.lower(): float(v) for k, v in raw.items() if v}
-        prices = {}
+def parse_reward_key(key):
+    """'SYM@0xaddr' -> (sym, addr); legacy bare 'SYM' -> (sym, known addr or None)."""
+    if "@" in key:
+        sym, addr = key.rsplit("@", 1)
+        return sym, addr.lower()
+    return key, TOKEN_ADDRESSES.get(key, "").lower() or None
+
+
+def collect_reward_addresses(snapshot_rows):
+    addrs = set()
+    for r in snapshot_rows:
+        for col in ("fees_rewards", "bribe_rewards"):
+            for key in json.loads(r.get(col) or "{}"):
+                _, addr = parse_reward_key(key)
+                if addr:
+                    addrs.add(addr)
+    return sorted(addrs)
+
+
+def fetch_prices_by_address(addresses):
+    """Batched GeckoTerminal price lookups: every address, 30 per call."""
+    prices = {}
+    failed_batches = 0
+    for i in range(0, len(addresses), 30):
+        batch = addresses[i:i + 30]
+        url = ("https://api.geckoterminal.com/api/v2/simple/networks/base/"
+               "token_price/" + "%2C".join(batch))
+        try:
+            req = urllib.request.Request(url, headers=HEADERS)
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                data = json.loads(resp.read().decode())
+            raw = data["data"]["attributes"]["token_prices"] or {}
+            for k, v in raw.items():
+                if v is not None:
+                    prices[k.lower()] = float(v)
+        except Exception as e:
+            failed_batches += 1
+            print(f"  (price batch {i//30 + 1} failed: {e})")
+        time.sleep(1.0)
+    print(f"Prices resolved for {len(prices)}/{len(addresses)} reward tokens"
+          + (f" ({failed_batches} batch(es) failed)" if failed_batches else ""))
+    # stable fallback for legacy rows if everything failed
+    if not prices:
+        print("WARNING: no live prices at all - stablecoin fallback only.")
         for sym, addr in TOKEN_ADDRESSES.items():
-            if addr.lower() in by_addr:
-                prices[sym] = by_addr[addr.lower()]
-        print(f"Live prices fetched for {len(prices)}/{len(TOKEN_ADDRESSES)} "
-              f"known tokens.")
-        return prices
-    except Exception as e:
-        print(f"WARNING: live price fetch failed ({e}).")
-        print("Falling back to stablecoins-only pricing - USD totals will be")
-        print("badly incomplete this run. Re-run later for full pricing.")
-        return dict(STABLE_FALLBACK)
+            if sym in STABLE_FALLBACK:
+                prices[addr.lower()] = 1.0
+    return prices
 
 
 def price_rewards(rewards_json, prices):
-    """JSON like {"USDC": 12.3} -> (usd_total, {sym: amt} unpriced)."""
+    """JSON {'SYM@addr': amt} (or legacy {'SYM': amt}) -> (usd, unpriced)."""
     usd, unpriced = 0.0, {}
-    for sym, amt in json.loads(rewards_json or "{}").items():
-        if sym in prices:
-            usd += amt * prices[sym]
+    for key, amt in json.loads(rewards_json or "{}").items():
+        sym, addr = parse_reward_key(key)
+        if addr and addr in prices:
+            usd += amt * prices[addr]
         else:
             unpriced[sym] = unpriced.get(sym, 0) + amt
     return usd, unpriced
@@ -129,7 +159,9 @@ def build_table():
     market_ts = list(market.keys())[-1]
     mkt = {r["pool_address"].lower(): r for r in market[market_ts]}
 
-    prices = fetch_token_prices()
+    reward_addrs = collect_reward_addresses(latest)
+    print(f"Distinct reward tokens in snapshot: {len(reward_addrs)}")
+    prices = fetch_prices_by_address(reward_addrs)
 
     pools = []
     unpriced_totals = defaultdict(float)
@@ -163,6 +195,8 @@ def build_table():
         p["fee_share"] = p["fees_usd"] / total_fees
         p["ratio"] = (p["fee_share"] / p["vote_share"]
                       if p["vote_share"] > 0 else None)
+        # dollars of epoch fees beyond (or below) the pool's fair share
+        p["excess_usd"] = round(p["fees_usd"] - p["vote_share"] * total_fees, 2)
         if p["votes_prev"] is not None:
             p["vote_delta"] = p["votes"] - p["votes_prev"]
             p["vote_delta_pct"] = (100 * p["vote_delta"] / p["votes_prev"]
@@ -177,7 +211,7 @@ def build_table():
         "n_pools": len(pools),
         "epoch_start": pools[0]["epoch_start"] if pools else "?",
         "unpriced_totals": dict(unpriced_totals),
-        "priced_syms": sorted(prices.keys()),
+        "n_priced_tokens": len(prices),
     }
     return pools, meta
 
@@ -208,6 +242,8 @@ def write_reports(pools, meta):
     except Exception:
         epoch_note, early = epoch_start, False
 
+    under_excess = sorted([p for p in pools if p["excess_usd"] > 0],
+                          key=lambda p: p["excess_usd"], reverse=True)[:TOP_N]
     under = sorted([p for p in pools if p["ratio"] is not None
                     and p["fees_usd"] >= MIN_FEES_USD_FOR_RANKING],
                    key=lambda p: p["ratio"], reverse=True)[:TOP_N]
@@ -239,18 +275,36 @@ def write_reports(pools, meta):
                  "few hours, so ratios are noisy. Trust trends across runs, "
                  "not single readings.")
     if meta["unpriced_totals"]:
-        toks = ", ".join(f"{s} ({a:,.2f})"
-                         for s, a in sorted(meta["unpriced_totals"].items()))
+        n_un = len(meta["unpriced_totals"])
+        sample = ", ".join(sorted(meta["unpriced_totals"])[:8])
         L.append("")
-        L.append(f"> Unpriced reward tokens this run (excluded from USD "
-                 f"totals): {toks}")
+        L.append(f"> {n_un} reward token(s) could not be priced this run "
+                 f"(e.g. {sample}). Their value is excluded from USD totals; "
+                 f"full amounts are in the CSV's 'unpriced' column.")
     L.append("")
 
-    L.append("## Under-allocated - earning more fee share than vote share")
+    L.append("## Biggest mispricings by dollars")
     L.append("")
-    L.append("*ratio = fee share / vote share. 2.0 means the pool earns "
-             "double the fees its votes 'deserve'. Voters are leaving money "
-             "here; these are the pools a forecaster front-runs.*")
+    L.append("*Excess $ = epoch fees beyond what the pool's vote share "
+             "'deserves'. This is where the most absolute money is being "
+             "left on the table.*")
+    L.append("")
+    L.append(md_row(["Pool", "Excess $", "Ratio", "Fees (epoch)", "Vote %",
+                     "24h Vol"]))
+    L.append(md_row(["---"] * 6))
+    for p in under_excess:
+        L.append(md_row([p["pool_name"], fmt_usd(p["excess_usd"]),
+                         f"{p['ratio']:.2f}" if p["ratio"] else "-",
+                         fmt_usd(p["fees_usd"]),
+                         f"{100*p['vote_share']:.3f}%",
+                         fmt_usd(p["vol24_usd"])]))
+    L.append("")
+
+    L.append("## Highest ratios (small-pool opportunities, min "
+             f"${MIN_FEES_USD_FOR_RANKING:.0f} fees)")
+    L.append("")
+    L.append("*ratio = fee share / vote share. Tiny vote shares inflate "
+             "ratios, so treat this as a candidate list, not a ranking.*")
     L.append("")
     L.append(md_row(["Pool", "Ratio", "Fees (epoch)", "Vote %", "24h Vol",
                      "Vote Δ"]))
@@ -330,7 +384,7 @@ def write_reports(pools, meta):
         f.write(report)
 
     fields = ["pool_address", "pool_name", "votes", "vote_share", "fees_usd",
-              "fee_share", "ratio", "bribes_usd", "emissions_day",
+              "fee_share", "ratio", "excess_usd", "bribes_usd", "emissions_day",
               "vol24_usd", "tvl_usd", "est_trading_fees_24h", "vote_delta",
               "vote_delta_pct", "unpriced"]
     csv_path = os.path.join(OUT_DIR, "mispricing_latest.csv")
