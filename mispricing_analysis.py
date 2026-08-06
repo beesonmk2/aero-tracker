@@ -1,6 +1,11 @@
 """
-Aerodrome Mispricing Analysis — Stage 1 (v1.1)
+Aerodrome Mispricing Analysis — Stage 1 (v1.2)
 ----------------------------------------------
+v1.2: price batches now retry on throttling (10s/30s backoff) like every
+other network call in this project; duplicate pool display names get a
+short address tag; pools whose fees are entirely in unpriced tokens are
+excluded from the over-allocated table instead of shown as $0.
+
 v1.1: prices EVERY reward token by on-chain address (batched lookups),
 ranks the headline table by excess dollars instead of raw ratio, and
 summarizes unpriced leftovers instead of listing hundreds of tokens.
@@ -105,18 +110,28 @@ def fetch_prices_by_address(addresses):
         batch = addresses[i:i + 30]
         url = ("https://api.geckoterminal.com/api/v2/simple/networks/base/"
                "token_price/" + "%2C".join(batch))
-        try:
-            req = urllib.request.Request(url, headers=HEADERS)
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                data = json.loads(resp.read().decode())
-            raw = data["data"]["attributes"]["token_prices"] or {}
+        got = None
+        for attempt, wait in enumerate([0, 10, 30]):
+            if wait:
+                print(f"  (price batch {i//30 + 1}: throttled or error - "
+                      f"waiting {wait}s and retrying...)")
+                time.sleep(wait)
+            try:
+                req = urllib.request.Request(url, headers=HEADERS)
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    got = json.loads(resp.read().decode())
+                break
+            except Exception as e:
+                err = e
+        if got is not None:
+            raw = got["data"]["attributes"]["token_prices"] or {}
             for k, v in raw.items():
                 if v is not None:
                     prices[k.lower()] = float(v)
-        except Exception as e:
+        else:
             failed_batches += 1
-            print(f"  (price batch {i//30 + 1} failed: {e})")
-        time.sleep(1.0)
+            print(f"  (price batch {i//30 + 1} FAILED after retries: {err})")
+        time.sleep(2.0)
     print(f"Prices resolved for {len(prices)}/{len(addresses)} reward tokens"
           + (f" ({failed_batches} batch(es) failed)" if failed_batches else ""))
     # stable fallback for legacy rows if everything failed
@@ -188,6 +203,13 @@ def build_table():
             "epoch_start": r["epoch_start_utc"],
         })
 
+    name_counts = defaultdict(int)
+    for p in pools:
+        name_counts[p["pool_name"]] += 1
+    for p in pools:
+        if name_counts[p["pool_name"]] > 1:
+            p["pool_name"] = f"{p['pool_name']} [{p['pool_address'][2:6]}]"
+
     total_votes = sum(p["votes"] for p in pools) or 1.0
     total_fees = sum(p["fees_usd"] for p in pools) or 1.0
     for p in pools:
@@ -248,8 +270,12 @@ def write_reports(pools, meta):
                     and p["fees_usd"] >= MIN_FEES_USD_FOR_RANKING],
                    key=lambda p: p["ratio"], reverse=True)[:TOP_N]
     over = sorted([p for p in pools if p["ratio"] is not None
-                   and p["vote_share"] >= MIN_VOTE_SHARE_FOR_OVER],
+                   and p["vote_share"] >= MIN_VOTE_SHARE_FOR_OVER
+                   and not (p["fees_usd"] == 0 and p["unpriced"])],
                   key=lambda p: p["ratio"])[:TOP_N]
+    n_unknown = sum(1 for p in pools
+                    if p["fees_usd"] == 0 and p["unpriced"]
+                    and p["vote_share"] >= MIN_VOTE_SHARE_FOR_OVER)
     orphans = sorted([p for p in pools if p["votes"] == 0
                       and p["fees_usd"] > 0],
                      key=lambda p: p["fees_usd"], reverse=True)[:10]
@@ -320,6 +346,11 @@ def write_reports(pools, meta):
 
     L.append("## Over-allocated - vote share exceeds fee share")
     L.append("")
+    if n_unknown:
+        L.append(f"*{n_unknown} pool(s) with meaningful votes but fully "
+                 f"unpriced fee tokens are excluded here - unknown is not "
+                 f"the same as zero.*")
+        L.append("")
     L.append(md_row(["Pool", "Ratio", "Fees (epoch)", "Vote %",
                      "Emissions/day", "Vote Δ"]))
     L.append(md_row(["---"] * 6))
