@@ -1,0 +1,35 @@
+name: Mispricing analysis
+
+on:
+  workflow_dispatch:        # button-only for Stage 1
+
+permissions:
+  contents: write
+
+concurrency:
+  group: mispricing-analysis
+  cancel-in-progress: false
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get the repository files
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run the mispricing analysis
+        run: python mispricing_analysis.py
+
+      - name: Save the reports
+        run: |
+          git config user.name "aero-snapshot-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add analysis/
+          git diff --cached --quiet || git commit -m "Analysis $(date -u +'%Y-%m-%d %H:%M') UTC"
+          git pull --rebase --autostash
+          git push
