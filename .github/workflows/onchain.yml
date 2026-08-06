@@ -8,6 +8,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: onchain-collector
+  cancel-in-progress: false
+
 jobs:
   onchain:
     runs-on: ubuntu-latest
