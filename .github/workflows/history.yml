@@ -1,0 +1,58 @@
+name: History Backfill
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "sample (quick test) or full (real backfill)"
+        required: true
+        default: "sample"
+        type: choice
+        options:
+          - sample
+          - full
+
+concurrency:
+  group: history-backfill
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install web3
+
+      - name: Run backfill
+        env:
+          MODE: ${{ inputs.mode }}
+          MAX_MINUTES: "300"
+        run: python history_backfill.py
+
+      - name: Commit and push results
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/history/
+          if git diff --cached --quiet; then
+            echo "No new data to commit."
+            exit 0
+          fi
+          git commit -m "History backfill: vote data update"
+          for i in 1 2 3 4 5; do
+            git pull --rebase && git push && break
+            echo "Push failed, retrying ($i/5)..."
+            sleep 10
+          done
