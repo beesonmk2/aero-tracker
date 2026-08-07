@@ -1,8 +1,14 @@
 """
-history_backfill.py  (v1.4)
+history_backfill.py  (v1.5)
 
 Scans the Base blockchain for every vote ever cast on Aerodrome and saves
 the results as one CSV file per weekly epoch, under data/history/votes/.
+
+v1.5: When the private endpoint fails its preflight, a deep diagnostic now
+      fires automatically: two raw test requests are sent and the FULL
+      response body from the provider is printed (with the API key
+      censored), so the provider's own explanation of the problem appears
+      in the log.
 
 v1.4: - Startup "shape check" for the PRIVATE_RPC_URL secret: reports what
         kind of value is stored (without ever revealing it), auto-repairs a
@@ -231,6 +237,36 @@ def raw_get_logs(w3, from_block, to_block):
 # Preflight: learn what each endpoint will actually serve
 # ---------------------------------------------------------------------------
 
+def diagnose_private_rpc():
+    """Send two raw test requests to the private endpoint and print the
+    provider's FULL response (key censored), so its own explanation of the
+    problem appears in the log."""
+    import requests as _rq
+    print("[diagnose] Private endpoint failed preflight — sending raw test "
+          "requests to capture the provider's actual explanation...",
+          flush=True)
+    tests = [
+        ("simple (eth_blockNumber)",
+         {"jsonrpc": "2.0", "id": 1, "method": "eth_blockNumber",
+          "params": []}),
+        ("event query (tiny eth_getLogs)",
+         {"jsonrpc": "2.0", "id": 2, "method": "eth_getLogs",
+          "params": [{"fromBlock": hex(QUIET_BLOCK),
+                      "toBlock": hex(QUIET_BLOCK + 49),
+                      "address": Web3.to_checksum_address(VOTER_ADDRESS),
+                      "topics": [[TOPIC_VOTED, TOPIC_ABSTAINED]]}]}),
+    ]
+    for name, payload in tests:
+        try:
+            r = _rq.post(PRIVATE_RPC_URL, json=payload, timeout=30)
+            body = scrub(r.text).strip()[:400]
+            print(f"[diagnose] {name}: HTTP {r.status_code} — "
+                  f"response body: {body}", flush=True)
+        except Exception as e:  # noqa: BLE001
+            print(f"[diagnose] {name}: request failed — "
+                  f"{type(e).__name__}: {scrub(str(e))[:200]}", flush=True)
+
+
 def preflight():
     """Test every endpoint against shrinking block ranges on a quiet part of
     the chain. Prints a report card, reorders RPC_ENDPOINTS from most to
@@ -260,6 +296,8 @@ def preflight():
         else:
             print(f"[preflight]   {rpc_name(url)}  ->  UNUSABLE for logs "
                   f"(last error: {last_err})", flush=True)
+            if url == PRIVATE_RPC_URL:
+                diagnose_private_rpc()
 
     # Most generous endpoints first.
     RPC_ENDPOINTS = sorted(RPC_ENDPOINTS, key=lambda u: -capability[u])
