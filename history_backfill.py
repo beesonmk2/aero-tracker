@@ -1,8 +1,14 @@
 """
-history_backfill.py  (v1.2)
+history_backfill.py  (v1.3)
 
 Scans the Base blockchain for every vote ever cast on Aerodrome and saves
 the results as one CSV file per weekly epoch, under data/history/votes/.
+
+v1.3: Support for a private RPC endpoint (a free Alchemy API key), provided
+      via the PRIVATE_RPC_URL environment variable / GitHub secret. If
+      present, it is tried first. The URL itself is never printed, because
+      a public repo means public logs. Endpoints answering "403 Forbidden"
+      are now blacklisted immediately instead of retried.
 
 v1.2: Debugging release.
       - Every RPC error is now printed with the endpoint name and the full
@@ -46,6 +52,25 @@ RPC_ENDPOINTS = [
     "https://1rpc.io/base",
 ]
 
+# A private endpoint (e.g. Alchemy) supplied as a GitHub secret. It gets
+# top priority. NEVER print this URL — it contains the API key.
+PRIVATE_RPC_URL = os.environ.get("PRIVATE_RPC_URL", "").strip()
+if PRIVATE_RPC_URL:
+    RPC_ENDPOINTS.insert(0, PRIVATE_RPC_URL)
+
+
+def rpc_name(url):
+    """Safe display name for an endpoint (hides the private URL/key)."""
+    return "PRIVATE-RPC (secret)" if url == PRIVATE_RPC_URL else url
+
+
+def scrub(text):
+    """Remove the private RPC URL (and thus the API key) from any text
+    before it is printed to the public logs."""
+    if PRIVATE_RPC_URL:
+        return text.replace(PRIVATE_RPC_URL, "PRIVATE-RPC")
+    return text
+
 # Aerodrome Voter contract on Base (the contract every vote goes through).
 VOTER_ADDRESS = "0x16613524e02ad97eDfeF371bC883F2F5d6C480A5"
 
@@ -88,10 +113,11 @@ TOPIC_ABSTAINED = norm_topic(Web3.keccak(text=SIG_ABSTAINED).hex())
 # Error classification
 # ---------------------------------------------------------------------------
 
-# Hints that an endpoint has a hard block-range policy -> use a different
-# endpoint for log queries.
+# Hints that an endpoint won't serve us at all, or has a hard block-range
+# policy -> stop asking it and use a different endpoint for log queries.
 RANGE_HINTS = ("blocks range", "block range", "range of blocks",
-               "limited to", "max range", "range limit")
+               "limited to", "max range", "range limit",
+               "403", "forbidden", "unauthorized", "401")
 
 # Hints that this particular request was too heavy (too many matching events,
 # or the endpoint timed out crunching it) -> shrink the batch and retry.
@@ -133,8 +159,8 @@ def rpc_call(fn, max_attempts=8):
         try:
             return fn(get_w3())
         except Exception as e:  # noqa: BLE001
-            print(f"[rpc-err] {RPC_ENDPOINTS[_current_rpc]}: "
-                  f"{type(e).__name__}: {str(e)[:200]}", flush=True)
+            print(f"[rpc-err] {rpc_name(RPC_ENDPOINTS[_current_rpc])}: "
+                  f"{type(e).__name__}: {scrub(str(e))[:200]}", flush=True)
             last_err = e
             get_w3(rotate=True)
             time.sleep(min(2 ** attempt, 10))
@@ -174,14 +200,14 @@ def preflight():
                 cap = size
                 break
             except Exception as e:  # noqa: BLE001
-                last_err = f"{type(e).__name__}: {str(e)[:160]}"
+                last_err = f"{type(e).__name__}: {scrub(str(e))[:160]}"
                 time.sleep(0.5)
         capability[url] = cap
         if cap:
-            print(f"[preflight]   {url}  ->  accepts {cap:,}-block ranges",
+            print(f"[preflight]   {rpc_name(url)}  ->  accepts {cap:,}-block ranges",
                   flush=True)
         else:
-            print(f"[preflight]   {url}  ->  UNUSABLE for logs "
+            print(f"[preflight]   {rpc_name(url)}  ->  UNUSABLE for logs "
                   f"(last error: {last_err})", flush=True)
 
     # Most generous endpoints first.
@@ -189,7 +215,8 @@ def preflight():
     _current_rpc = 0
     _w3 = None
     best = capability[RPC_ENDPOINTS[0]]
-    print(f"[preflight] Endpoint order is now: {RPC_ENDPOINTS}", flush=True)
+    print(f"[preflight] Endpoint order is now: "
+          f"{[rpc_name(u) for u in RPC_ENDPOINTS]}", flush=True)
     print(f"[preflight] Best usable range: {best:,} blocks", flush=True)
     return best
 
@@ -352,9 +379,9 @@ def fetch_logs(from_block, to_block):
         try:
             return raw_get_logs(get_w3(), from_block, to_block)
         except Exception as e:  # noqa: BLE001
-            msg = f"{type(e).__name__}: {str(e)[:200]}"
+            msg = f"{type(e).__name__}: {scrub(str(e))[:200]}"
             kind = classify(str(e))
-            print(f"[rpc-err] {url} ({kind}): {msg}", flush=True)
+            print(f"[rpc-err] {rpc_name(url)} ({kind}): {msg}", flush=True)
             if kind == "range":
                 BAD_LOG_RPCS.add(_current_rpc)
                 get_w3(rotate=True)
