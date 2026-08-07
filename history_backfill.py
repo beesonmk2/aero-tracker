@@ -1,5 +1,11 @@
 """
-history_backfill.py  (v1.0)
+history_backfill.py  (v1.1)
+
+v1.1: Some free RPC endpoints only allow tiny block ranges for event queries
+      (one allows just 50 blocks). Instead of shrinking our batch size to
+      match the stingiest endpoint, we now blacklist stingy endpoints for
+      log queries and rotate to a more generous one. Batch shrinking is the
+      last resort, used only if every endpoint refuses.
 
 Scans the Base blockchain for every vote ever cast on Aerodrome and saves
 the results as one CSV file per weekly epoch, under data/history/votes/.
@@ -58,7 +64,7 @@ START_BLOCK = 3_000_000
 # Initial number of blocks to request per call. Automatically halved when an
 # endpoint complains, down to MIN_CHUNK.
 INITIAL_CHUNK = 10_000
-MIN_CHUNK = 250
+MIN_CHUNK = 50  # absolute floor; only reached if every endpoint is stingy
 
 # Stop cleanly after this many minutes so GitHub can commit the results.
 MAX_MINUTES = int(os.environ.get("MAX_MINUTES", "300"))
@@ -281,15 +287,53 @@ def flush_to_disk(next_block):
 # Scanning
 # ---------------------------------------------------------------------------
 
+# Endpoints that have refused our batch size for log queries. They stay
+# blacklisted until every endpoint has refused, at which point we clear the
+# list and let the caller try again with a smaller batch.
+BAD_LOG_RPCS = set()
+
+
 def fetch_logs(from_block, to_block):
-    def _do(w3):
-        return w3.eth.get_logs({
-            "fromBlock": from_block,
-            "toBlock": to_block,
-            "address": Web3.to_checksum_address(VOTER_ADDRESS),
-            "topics": [[TOPIC_VOTED, TOPIC_ABSTAINED]],
-        })
-    return rpc_call(_do)
+    """Fetch vote events for a block range, preferring endpoints that can
+    handle large ranges. Raises RuntimeError('too_big') only if EVERY
+    endpoint refuses the range."""
+    global _current_rpc
+    attempts = 0
+    while attempts < 16:
+        attempts += 1
+
+        # Skip past blacklisted endpoints.
+        hops = 0
+        while _current_rpc in BAD_LOG_RPCS and hops < len(RPC_ENDPOINTS):
+            get_w3(rotate=True)
+            hops += 1
+        if len(BAD_LOG_RPCS) >= len(RPC_ENDPOINTS):
+            # Everyone refused at this size — reset and tell caller to shrink.
+            BAD_LOG_RPCS.clear()
+            raise RuntimeError("too_big")
+
+        try:
+            w3 = get_w3()
+            return w3.eth.get_logs({
+                "fromBlock": from_block,
+                "toBlock": to_block,
+                "address": Web3.to_checksum_address(VOTER_ADDRESS),
+                "topics": [[TOPIC_VOTED, TOPIC_ABSTAINED]],
+            })
+        except Exception as e:  # noqa: BLE001
+            msg = str(e).lower()
+            if any(s in msg for s in ("too many", "limit", "range", "10000",
+                                      "response size", "exceed", "larger")):
+                print(f"[rpc] endpoint {RPC_ENDPOINTS[_current_rpc]} refused "
+                      f"this range — blacklisting it for log queries.",
+                      flush=True)
+                BAD_LOG_RPCS.add(_current_rpc)
+                get_w3(rotate=True)
+                continue
+            # Ordinary flakiness: rotate and back off briefly.
+            get_w3(rotate=True)
+            time.sleep(min(2 ** min(attempts, 5), 20))
+    raise RuntimeError("all RPC attempts failed while fetching logs")
 
 
 def scan_range(from_block, to_block, chunk):
