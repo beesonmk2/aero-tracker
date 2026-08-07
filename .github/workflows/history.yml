@@ -39,6 +39,7 @@ jobs:
         env:
           MODE: ${{ inputs.mode }}
           MAX_MINUTES: "300"
+          PRIVATE_RPC_URL: ${{ secrets.PRIVATE_RPC_URL }}
         run: python history_backfill.py
 
       - name: Commit and push results
