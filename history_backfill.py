@@ -1,8 +1,22 @@
 """
-history_backfill.py  (v1.8)
+history_backfill.py  (v1.10)
 
 Scans the Base blockchain for every vote ever cast on Aerodrome and saves
 the results as one CSV file per weekly epoch, under data/history/votes/.
+
+v1.10: An unbroken wall of 429 responses is recognized as daily-quota
+       exhaustion (not pacing). The scan stops cleanly, saves its exact
+       position, and says so — the quota renews every 24 hours and the
+       next run resumes from that block.
+
+v1.9: - When a "too many results" error names the exact block range that
+        WILL work, the scan uses that suggested range directly instead of
+        blindly halving its batch size seven times.
+      - The batch can now shrink all the way to a single block for
+        extreme vote-density moments (epoch-flip bursts).
+      - If even one block ever exceeds the provider's result limit, it is
+        recorded loudly in _skipped_blocks.json instead of crashing —
+        no data gap can ever be silent.
 
 v1.8: SCHEMA v2. New final_weight column: the voter's standing allocation
       for the pool at epoch close, computed last-event-wins (a Voted event
@@ -539,6 +553,7 @@ def fetch_logs(from_block, to_block):
     printed."""
     global _current_rpc
     attempts = 0
+    consecutive_throttles = 0
     while attempts < 12:
         attempts += 1
 
@@ -558,8 +573,15 @@ def fetch_logs(from_block, to_block):
             kind = classify(str(e))
             print(f"[rpc-err] {rpc_name(url)} ({kind}): {msg}", flush=True)
             if kind == "throttle":
+                consecutive_throttles += 1
+                if consecutive_throttles >= 8:
+                    # A wall of unbroken 429s means the DAILY quota is spent,
+                    # not that we're going too fast. Stop cleanly; the quota
+                    # renews every 24 hours and the run resumes from here.
+                    raise RuntimeError("quota")
                 time.sleep(2.0)   # breathe, then re-ask the same endpoint
             elif kind == "range":
+                consecutive_throttles = 0
                 BAD_LOG_RPCS.add(_current_rpc)
                 get_w3(rotate=True)
             elif kind == "size":
@@ -615,6 +637,13 @@ def scan_range(from_block, to_block, chunk):
             logs = fetch_logs(current, end)
         except RuntimeError as e:
             m = str(e)
+            if m == "quota":
+                print(f"[scan] 🛑 Daily API quota appears exhausted at block "
+                      f"{current:,}. Progress saved — the quota renews every "
+                      f"24 hours; run the workflow again tomorrow and it "
+                      f"will resume from exactly here.", flush=True)
+                flush_to_disk(current)
+                return processed, unknown, False
             if m.startswith("shrink_to:"):
                 new_end = int(m.split(":")[1])
                 if forced_end is not None and new_end >= forced_end:
