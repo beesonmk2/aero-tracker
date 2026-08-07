@@ -1,25 +1,19 @@
 """
-history_backfill.py  (v1.5)
+history_backfill.py  (v1.6)
 
 Scans the Base blockchain for every vote ever cast on Aerodrome and saves
 the results as one CSV file per weekly epoch, under data/history/votes/.
 
-v1.5: When the private endpoint fails its preflight, a deep diagnostic now
-      fires automatically: two raw test requests are sent and the FULL
-      response body from the provider is printed (with the API key
-      censored), so the provider's own explanation of the problem appears
-      in the log.
+v1.6: - Fixed a misclassification: "query returned more than 10000 results
+        ... try with this block range" errors were being read as a range
+        POLICY refusal (endpoint blacklisted) instead of a request-too-fat
+        signal (shrink the batch). Size symptoms are now checked first.
+      - Batch size can now cautiously grow back after a long streak of
+        successes, so one dense voting period doesn't cap throughput for
+        the entire multi-year scan.
 
-v1.4: - Startup "shape check" for the PRIVATE_RPC_URL secret: reports what
-        kind of value is stored (without ever revealing it), auto-repairs a
-        bare API key into a full Base mainnet Alchemy URL, and warns if the
-        URL points at the wrong network.
-      - Endpoints that fail the preflight are benched for the whole run
-        instead of being retried during scanning.
-      - Scanning stops ~1,000 blocks before the chain tip, where public
-        nodes are often unreliable.
-
-v1.3: Private RPC endpoint support via the PRIVATE_RPC_URL secret.
+v1.5: Deep diagnostic prints the provider's full response body when the
+      private endpoint fails preflight.
 
 v1.2: Debugging release.
       - Every RPC error is now printed with the endpoint name and the full
@@ -178,16 +172,19 @@ RANGE_HINTS = ("blocks range", "block range", "range of blocks",
 
 # Hints that this particular request was too heavy (too many matching events,
 # or the endpoint timed out crunching it) -> shrink the batch and retry.
+# IMPORTANT: these are checked FIRST, because size errors often include
+# helpful advice containing the words "block range".
 SIZE_HINTS = ("more than", "response size", "too many results", "timeout",
-              "timed out", "read timed out", "10000 results", "query returned")
+              "timed out", "read timed out", "10000 results", "query returned",
+              "-32005", "try with this block range", "log response size")
 
 
 def classify(err_msg):
     m = err_msg.lower()
-    if any(h in m for h in RANGE_HINTS):
-        return "range"
     if any(h in m for h in SIZE_HINTS):
         return "size"
+    if any(h in m for h in RANGE_HINTS):
+        return "range"
     return "other"
 
 
@@ -501,7 +498,9 @@ def scan_range(from_block, to_block, chunk):
     start_time = time.time()
     last_checkpoint = time.time()
     current = from_block
-    chunk_cap = chunk  # highest batch size we currently believe is safe
+    chunk_cap = chunk    # highest batch size we currently believe is safe
+    initial_cap = chunk  # ceiling the cap may recover to after clean streaks
+    streak = 0           # consecutive successful fetches since last shrink
 
     while current <= to_block:
         end = min(current + chunk - 1, to_block)
@@ -511,6 +510,7 @@ def scan_range(from_block, to_block, chunk):
             if str(e) == "shrink" and chunk > MIN_CHUNK:
                 chunk = max(MIN_CHUNK, chunk // 2)
                 chunk_cap = chunk  # don't grow back into the same wall
+                streak = 0
                 print(f"[scan] shrinking batch to {chunk} blocks", flush=True)
                 continue
             raise
@@ -524,12 +524,20 @@ def scan_range(from_block, to_block, chunk):
                 processed += 1
 
         current = end + 1
+        streak += 1
         time.sleep(0.12)
 
-        # Grow the batch back cautiously, but never beyond the cap that the
-        # endpoints have demonstrated they can handle.
+        # Grow the batch back cautiously within the demonstrated-safe cap...
         if len(logs) < 2000 and chunk < chunk_cap:
             chunk = min(chunk_cap, chunk * 2)
+        # ...and after a long streak of clean fetches, allow the cap itself
+        # to rise again — a dense voting rush shouldn't throttle the whole
+        # multi-year scan.
+        elif streak >= 25 and chunk == chunk_cap and chunk_cap < initial_cap:
+            chunk_cap = min(initial_cap, chunk_cap * 2)
+            streak = 0
+            print(f"[scan] raising batch cap back to {chunk_cap} blocks "
+                  f"after a clean streak", flush=True)
 
         elapsed_min = (time.time() - start_time) / 60
         if (time.time() - last_checkpoint) / 60 >= CHECKPOINT_MINUTES:
