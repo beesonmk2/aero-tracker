@@ -1,8 +1,6 @@
 name: Aerodrome onchain snapshot
 
 on:
-  schedule:
-    - cron: "37 * * * *"   # every hour, at 37 minutes past (offset from the market tracker)
   workflow_dispatch:        # manual "Run workflow" button for testing
 
 permissions:
