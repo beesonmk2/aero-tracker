@@ -1,0 +1,38 @@
+name: Vote plan
+
+on:
+  workflow_dispatch:        # button-only, run when you're about to vote
+
+permissions:
+  contents: write
+
+concurrency:
+  group: vote-plan
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get the repository files
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Refresh the mispricing analysis
+        run: python mispricing_analysis.py
+
+      - name: Generate the vote plan
+        run: python vote_optimizer.py
+
+      - name: Save the outputs
+        run: |
+          git config user.name "aero-snapshot-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add analysis/ voteplan/
+          git diff --cached --quiet || git commit -m "Vote plan $(date -u +'%Y-%m-%d %H:%M') UTC"
+          git pull --rebase --autostash
+          git push
