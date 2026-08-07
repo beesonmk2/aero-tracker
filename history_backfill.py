@@ -52,6 +52,7 @@ Modes (set via the MODE environment variable):
 
 import csv
 import json
+import re
 import os
 import sys
 import time
@@ -149,7 +150,7 @@ START_BLOCK = 3_000_000
 QUIET_BLOCK = 3_000_000
 
 INITIAL_CHUNK = 10_000
-MIN_CHUNK = 50
+MIN_CHUNK = 1
 PREFLIGHT_SIZES = [10_000, 2_000, 500, 50]
 
 MAX_MINUTES = int(os.environ.get("MAX_MINUTES", "300"))
@@ -523,11 +524,19 @@ def flush_to_disk(next_block):
 
 BAD_LOG_RPCS = set()
 
+# Matches the provider's advice inside a "too many results" error, e.g.
+# "Try with this block range [0x27CB729, 0x27CB746]" /
+# "'from': '0x27CB729', ..., 'to': '0x27CB746'".
+_SUGGEST_RE = re.compile(
+    r"'from':\s*'0x([0-9a-fA-F]+)'.*?'to':\s*'0x([0-9a-fA-F]+)'")
+
 
 def fetch_logs(from_block, to_block):
     """Fetch vote events for a block range.
-    Raises RuntimeError('shrink') when the caller should retry with a
-    smaller batch. Every underlying error is printed."""
+    Raises RuntimeError('shrink_to:N') when the provider names the exact
+    range that WILL work (N = last block of that range), or plain
+    RuntimeError('shrink') when it doesn't. Every underlying error is
+    printed."""
     global _current_rpc
     attempts = 0
     while attempts < 12:
@@ -554,12 +563,39 @@ def fetch_logs(from_block, to_block):
                 BAD_LOG_RPCS.add(_current_rpc)
                 get_w3(rotate=True)
             elif kind == "size":
+                m = _SUGGEST_RE.search(str(e))
+                if m:
+                    sug_from = int(m.group(1), 16)
+                    sug_to = int(m.group(2), 16)
+                    if sug_from == from_block and from_block <= sug_to < to_block:
+                        raise RuntimeError(f"shrink_to:{sug_to}") from e
                 raise RuntimeError("shrink") from e
             else:
                 get_w3(rotate=True)
                 time.sleep(min(2 ** min(attempts, 3), 8))
     raise RuntimeError("all RPC attempts failed while fetching logs "
                        "(see [rpc-err] lines above for the reasons)")
+
+
+def record_skipped_block(block):
+    """A block whose events couldn't be fetched even one-at-a-time. Should
+    never happen; if it does, we keep a loud, permanent record so no data
+    gap can ever be silent."""
+    path = os.path.join(OUT_DIR, "_skipped_blocks.json")
+    os.makedirs(OUT_DIR, exist_ok=True)
+    skipped = []
+    if os.path.exists(path):
+        try:
+            with open(path) as f:
+                skipped = json.load(f)
+        except Exception:  # noqa: BLE001
+            skipped = []
+    skipped.append(block)
+    with open(path, "w") as f:
+        json.dump(skipped, f)
+    print(f"[scan] ⚠️  WARNING: block {block:,} exceeded the provider's "
+          f"result limit even alone — recorded in _skipped_blocks.json and "
+          f"skipped. Report this!", flush=True)
 
 
 def scan_range(from_block, to_block, chunk):
@@ -571,17 +607,37 @@ def scan_range(from_block, to_block, chunk):
     chunk_cap = chunk    # highest batch size we currently believe is safe
     initial_cap = chunk  # ceiling the cap may recover to after clean streaks
     streak = 0           # consecutive successful fetches since last shrink
+    forced_end = None    # provider-suggested exact end block, when given
 
     while current <= to_block:
-        end = min(current + chunk - 1, to_block)
+        end = forced_end if forced_end is not None else min(current + chunk - 1, to_block)
         try:
             logs = fetch_logs(current, end)
         except RuntimeError as e:
-            if str(e) == "shrink" and chunk > MIN_CHUNK:
-                chunk = max(MIN_CHUNK, chunk // 2)
-                chunk_cap = chunk  # don't grow back into the same wall
-                streak = 0
-                print(f"[scan] shrinking batch to {chunk} blocks", flush=True)
+            m = str(e)
+            if m.startswith("shrink_to:"):
+                new_end = int(m.split(":")[1])
+                if forced_end is not None and new_end >= forced_end:
+                    # The suggestion isn't improving; fall back to halving.
+                    forced_end = None
+                else:
+                    forced_end = min(new_end, to_block)
+                    print(f"[scan] provider suggested exact range — fetching "
+                          f"{current:,} to {forced_end:,}", flush=True)
+                    continue
+            if m == "shrink" or m.startswith("shrink_to:"):
+                forced_end = None
+                if chunk > 1:
+                    chunk = max(1, chunk // 2)
+                    chunk_cap = chunk  # don't grow back into the same wall
+                    streak = 0
+                    print(f"[scan] shrinking batch to {chunk} blocks", flush=True)
+                    continue
+                # Even a single block overflows the provider's limit. That
+                # should be physically impossible, but never lose data
+                # silently: record it loudly and move on.
+                record_skipped_block(current)
+                current += 1
                 continue
             raise
 
@@ -594,6 +650,7 @@ def scan_range(from_block, to_block, chunk):
                 processed += 1
 
         current = end + 1
+        forced_end = None
         streak += 1
         time.sleep(0.45)  # stay under Infura's per-second credit throttle
 
