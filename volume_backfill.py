@@ -1,5 +1,13 @@
 """
-volume_backfill.py  (v1.0)
+volume_backfill.py  (v1.1)
+
+v1.1: - Pagination fix: keep requesting older pages until the API returns
+        an EMPTY page, instead of stopping when a page has fewer candles
+        than requested (the API serves ~180 candles per response no matter
+        what limit is asked for). This tests whether deep history exists
+        beyond the ~6-month window every pool returned in v1.0.
+      - Schema marker added: shallow v1.0 files are wiped and refetched.
+      - Politeness spacing raised to reduce rate-limit pauses.
 
 Fetches full daily price/volume history (OHLCV candles) for every pool that
 has ever appeared in Aerodrome's vote history, using GeckoTerminal's free
@@ -49,12 +57,39 @@ EARLIEST_TS = int(datetime(2023, 8, 1, tzinfo=timezone.utc).timestamp())
 
 # GeckoTerminal free tier: ~30 calls/minute. 2.2s spacing keeps us safely
 # under it.
-CALL_SPACING_SECONDS = 2.2
+CALL_SPACING_SECONDS = 2.7
 
 # Stop cleanly after this many minutes so GitHub can commit the results.
 MAX_MINUTES = int(os.environ.get("MAX_MINUTES", "300"))
 
 FIELDNAMES = ["date", "open", "high", "low", "close", "volume_usd"]
+
+SCHEMA_VERSION = 2
+SCHEMA_MARKER = os.path.join(OUT_DIR, "_schema.json")
+
+
+def ensure_schema():
+    """Wipe files written by an older version of this script (they may be
+    shallow) and stamp the folder with the current schema version."""
+    os.makedirs(OUT_DIR, exist_ok=True)
+    current = 0
+    if os.path.exists(SCHEMA_MARKER):
+        try:
+            with open(SCHEMA_MARKER) as f:
+                current = json.load(f).get("version", 0)
+        except Exception:  # noqa: BLE001
+            current = 0
+    if current != SCHEMA_VERSION:
+        removed = 0
+        for name in os.listdir(OUT_DIR):
+            p = os.path.join(OUT_DIR, name)
+            if os.path.isfile(p):
+                os.remove(p)
+                removed += 1
+        with open(SCHEMA_MARKER, "w") as f:
+            json.dump({"version": SCHEMA_VERSION}, f)
+        print(f"[schema] Cleared {removed} files from an older script "
+              f"version; they will be refetched at full depth.", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -128,7 +163,8 @@ def fetch_pool_history(pool):
     rows = {}
     meta = None
     before = int(time.time())
-    for _page in range(8):  # 8 pages x 1000 days >> anything we need
+    prev_oldest = None
+    for _page in range(14):  # 14 pages x ~180 days comfortably covers 3+ years
         data = api_get(
             f"/networks/{NETWORK}/pools/{pool}/ohlcv/day",
             {"aggregate": 1, "limit": 1000, "currency": "usd",
@@ -141,7 +177,7 @@ def fetch_pool_history(pool):
         candles = (data.get("data", {}) or {}).get(
             "attributes", {}).get("ohlcv_list") or []
         if not candles:
-            break
+            break  # a truly EMPTY page means we've reached the beginning
         for c in candles:
             ts = int(c[0])
             rows[ts] = {
@@ -150,8 +186,11 @@ def fetch_pool_history(pool):
                 "volume_usd": c[5],
             }
         oldest = min(int(c[0]) for c in candles)
-        if oldest <= EARLIEST_TS or len(candles) < 1000:
-            break
+        if oldest <= EARLIEST_TS:
+            break  # reached back before Aerodrome existed
+        if prev_oldest is not None and oldest >= prev_oldest:
+            break  # no progress: API won't serve anything older
+        prev_oldest = oldest
         before = oldest
     ordered = [rows[ts] for ts in sorted(rows)]
     return ordered, meta
@@ -198,6 +237,8 @@ def append_index(pool, meta, n_days):
 def main():
     mode = os.environ.get("MODE", "sample").lower()
     start = time.time()
+
+    ensure_schema()
 
     pools = discover_pools()
     if not pools:
