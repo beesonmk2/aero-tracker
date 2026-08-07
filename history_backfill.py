@@ -1,8 +1,23 @@
 """
-history_backfill.py  (v1.6)
+history_backfill.py  (v1.8)
 
 Scans the Base blockchain for every vote ever cast on Aerodrome and saves
 the results as one CSV file per weekly epoch, under data/history/votes/.
+
+v1.8: SCHEMA v2. New final_weight column: the voter's standing allocation
+      for the pool at epoch close, computed last-event-wins (a Voted event
+      sets it, an Abstained event zeroes it, latest timestamp rules). This
+      fixes two distortions in the raw sums: cross-epoch vote resets
+      showing up as negative votes (~34% of rows), and intra-epoch
+      re-votes being double-counted (~0.4%). Sum columns are kept as
+      activity-intensity signals. Old-format files are detected via a
+      schema marker and cleared automatically on first run.
+
+v1.7: - Rate-limit (429) responses are now classified as "throttle": the
+        script waits briefly and re-asks the same endpoint instead of
+        detouring through flakier ones.
+      - Politeness delay between chunks raised to respect Infura's
+        per-second credit throttle.
 
 v1.6: - Fixed a misclassification: "query returned more than 10000 results
         ... try with this block range" errors were being read as a range
@@ -179,8 +194,16 @@ SIZE_HINTS = ("more than", "response size", "too many results", "timeout",
               "-32005", "try with this block range", "log response size")
 
 
+# Hints that we're being rate-limited -> wait briefly and re-ask the SAME
+# endpoint. Checked before everything else.
+THROTTLE_HINTS = ("429", "too many requests", "rate limit", "rate-limit",
+                  "throughput")
+
+
 def classify(err_msg):
     m = err_msg.lower()
+    if any(h in m for h in THROTTLE_HINTS):
+        return "throttle"
     if any(h in m for h in SIZE_HINTS):
         return "size"
     if any(h in m for h in RANGE_HINTS):
@@ -359,27 +382,65 @@ def epoch_label(ts):
 
 
 # ---------------------------------------------------------------------------
-# Aggregation and file output
+# Aggregation and file output  (SCHEMA v2)
 # ---------------------------------------------------------------------------
+
+SCHEMA_VERSION = 2
+SCHEMA_MARKER = os.path.join(OUT_DIR, "_schema.json")
 
 agg = defaultdict(lambda: {
     "voter": "",
-    "voted_weight": 0.0,
-    "abstained_weight": 0.0,
+    "final_weight": 0.0,      # standing allocation at epoch close
+    "voted_weight": 0.0,      # sum of all Voted weights (activity signal)
+    "abstained_weight": 0.0,  # sum of all Abstained weights (activity signal)
     "n_voted": 0,
     "n_abstained": 0,
     "last_event_ts": 0,
 })
 
-FIELDNAMES = ["epoch_start", "pool", "token_id", "voter", "voted_weight",
-              "abstained_weight", "n_voted", "n_abstained", "last_event_ts"]
+FIELDNAMES = ["epoch_start", "pool", "token_id", "voter", "final_weight",
+              "voted_weight", "abstained_weight", "n_voted", "n_abstained",
+              "last_event_ts"]
+
+
+def ensure_schema():
+    """If the output folder contains files written under an older schema,
+    clear them (they are fully regenerable from chain) and stamp the folder
+    with the current schema version."""
+    os.makedirs(OUT_DIR, exist_ok=True)
+    current = 0
+    if os.path.exists(SCHEMA_MARKER):
+        try:
+            with open(SCHEMA_MARKER) as f:
+                current = json.load(f).get("version", 0)
+        except Exception:  # noqa: BLE001
+            current = 0
+    if current != SCHEMA_VERSION:
+        removed = 0
+        for name in os.listdir(OUT_DIR):
+            path = os.path.join(OUT_DIR, name)
+            if os.path.isfile(path):
+                os.remove(path)
+                removed += 1
+        with open(SCHEMA_MARKER, "w") as f:
+            json.dump({"version": SCHEMA_VERSION}, f)
+        print(f"[schema] Output format changed (v{current} -> "
+              f"v{SCHEMA_VERSION}); cleared {removed} old files. The scan "
+              f"will regenerate everything in the new format.", flush=True)
 
 
 def add_event(ev):
     key = (epoch_label(ev["ts"]), ev["pool"], ev["token_id"])
     row = agg[key]
     row["voter"] = ev["voter"]
+
+    # Last event wins for the standing allocation. Events are processed in
+    # chain order, so on equal timestamps (abstain+vote in one transaction)
+    # the later log correctly overrides the earlier one.
+    if ev["ts"] >= row["last_event_ts"]:
+        row["final_weight"] = ev["weight"] if ev["kind"] == "voted" else 0.0
     row["last_event_ts"] = max(row["last_event_ts"], ev["ts"])
+
     if ev["kind"] == "voted":
         row["voted_weight"] += ev["weight"]
         row["n_voted"] += 1
@@ -405,6 +466,7 @@ def flush_to_disk(next_block):
                     k = (r["pool"], int(r["token_id"]))
                     existing[k] = {
                         "voter": r["voter"],
+                        "final_weight": float(r["final_weight"]),
                         "voted_weight": float(r["voted_weight"]),
                         "abstained_weight": float(r["abstained_weight"]),
                         "n_voted": int(r["n_voted"]),
@@ -415,6 +477,11 @@ def flush_to_disk(next_block):
         for k, row in rows.items():
             if k in existing:
                 e = existing[k]
+                # Standing allocation: whichever side saw the later event
+                # holds the truth. Run slices scan forward in block order,
+                # so the newer slice wins ties.
+                if row["last_event_ts"] >= e["last_event_ts"]:
+                    e["final_weight"] = row["final_weight"]
                 e["voted_weight"] += row["voted_weight"]
                 e["abstained_weight"] += row["abstained_weight"]
                 e["n_voted"] += row["n_voted"]
@@ -433,6 +500,7 @@ def flush_to_disk(next_block):
                     "pool": pool,
                     "token_id": token_id,
                     "voter": e["voter"],
+                    "final_weight": round(e["final_weight"], 6),
                     "voted_weight": round(e["voted_weight"], 6),
                     "abstained_weight": round(e["abstained_weight"], 6),
                     "n_voted": e["n_voted"],
@@ -480,7 +548,9 @@ def fetch_logs(from_block, to_block):
             msg = f"{type(e).__name__}: {scrub(str(e))[:200]}"
             kind = classify(str(e))
             print(f"[rpc-err] {rpc_name(url)} ({kind}): {msg}", flush=True)
-            if kind == "range":
+            if kind == "throttle":
+                time.sleep(2.0)   # breathe, then re-ask the same endpoint
+            elif kind == "range":
                 BAD_LOG_RPCS.add(_current_rpc)
                 get_w3(rotate=True)
             elif kind == "size":
@@ -525,7 +595,7 @@ def scan_range(from_block, to_block, chunk):
 
         current = end + 1
         streak += 1
-        time.sleep(0.12)
+        time.sleep(0.45)  # stay under Infura's per-second credit throttle
 
         # Grow the batch back cautiously within the demonstrated-safe cap...
         if len(logs) < 2000 and chunk < chunk_cap:
@@ -565,6 +635,8 @@ def main():
 
     for line in _SECRET_REPORT:
         print(line, flush=True)
+
+    ensure_schema()
 
     best_range = preflight()
     if best_range == 0:
