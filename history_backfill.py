@@ -1,14 +1,19 @@
 """
-history_backfill.py  (v1.3)
+history_backfill.py  (v1.4)
 
 Scans the Base blockchain for every vote ever cast on Aerodrome and saves
 the results as one CSV file per weekly epoch, under data/history/votes/.
 
-v1.3: Support for a private RPC endpoint (a free Alchemy API key), provided
-      via the PRIVATE_RPC_URL environment variable / GitHub secret. If
-      present, it is tried first. The URL itself is never printed, because
-      a public repo means public logs. Endpoints answering "403 Forbidden"
-      are now blacklisted immediately instead of retried.
+v1.4: - Startup "shape check" for the PRIVATE_RPC_URL secret: reports what
+        kind of value is stored (without ever revealing it), auto-repairs a
+        bare API key into a full Base mainnet Alchemy URL, and warns if the
+        URL points at the wrong network.
+      - Endpoints that fail the preflight are benched for the whole run
+        instead of being retried during scanning.
+      - Scanning stops ~1,000 blocks before the chain tip, where public
+        nodes are often unreliable.
+
+v1.3: Private RPC endpoint support via the PRIVATE_RPC_URL secret.
 
 v1.2: Debugging release.
       - Every RPC error is now printed with the endpoint name and the full
@@ -54,7 +59,53 @@ RPC_ENDPOINTS = [
 
 # A private endpoint (e.g. Alchemy) supplied as a GitHub secret. It gets
 # top priority. NEVER print this URL — it contains the API key.
-PRIVATE_RPC_URL = os.environ.get("PRIVATE_RPC_URL", "").strip()
+
+def _normalize_private_rpc(raw):
+    """Clean up the stored secret and report its shape WITHOUT revealing it.
+    Returns (url, list_of_report_lines). url is "" if unusable."""
+    report = []
+    val = raw.strip().strip('"').strip("'").strip()
+    if not val:
+        return "", ["[secret-check] No PRIVATE_RPC_URL secret found — "
+                    "running on public endpoints only."]
+
+    if val.lower().startswith("http"):
+        if "/v2/" in val:
+            key = val.split("/v2/", 1)[1].strip("/")
+            if len(key) >= 10:
+                report.append(f"[secret-check] Secret is a full URL with a "
+                              f"{len(key)}-character key after /v2/ — shape OK.")
+            else:
+                report.append("[secret-check] PROBLEM: secret is a URL that "
+                              "ends at /v2/ with no API key after it. Update "
+                              "the secret to include the key at the end.")
+                return "", report
+        else:
+            report.append("[secret-check] Secret is a URL without /v2/ in it "
+                          "— accepting it, but if this is Alchemy, the URL "
+                          "usually contains /v2/ followed by the key.")
+        if "base-mainnet" not in val and "alchemy" in val:
+            report.append("[secret-check] WARNING: this Alchemy URL does not "
+                          "contain 'base-mainnet' — it may point at the wrong "
+                          "network. It must be the Base Mainnet endpoint.")
+        return val, report
+
+    # Not a URL. Maybe the bare API key was stored instead.
+    if 10 <= len(val) <= 100 and "/" not in val and " " not in val:
+        report.append(f"[secret-check] Secret looks like a bare "
+                      f"{len(val)}-character API key rather than a URL — "
+                      f"auto-building the Base mainnet Alchemy URL around it.")
+        return "https://base-mainnet.g.alchemy.com/v2/" + val, report
+
+    report.append(f"[secret-check] PROBLEM: secret is {len(val)} characters "
+                  "and is neither a URL nor a plausible API key. Please "
+                  "re-copy the endpoint URL from the Alchemy dashboard and "
+                  "update the secret.")
+    return "", report
+
+
+PRIVATE_RPC_URL, _SECRET_REPORT = _normalize_private_rpc(
+    os.environ.get("PRIVATE_RPC_URL", ""))
 if PRIVATE_RPC_URL:
     RPC_ENDPOINTS.insert(0, PRIVATE_RPC_URL)
 
@@ -214,6 +265,18 @@ def preflight():
     RPC_ENDPOINTS = sorted(RPC_ENDPOINTS, key=lambda u: -capability[u])
     _current_rpc = 0
     _w3 = None
+
+    # Bench every endpoint that failed the preflight entirely, so scanning
+    # never wastes attempts on them. (If every working endpoint later dies,
+    # fetch_logs clears the bench as a true last resort.)
+    BAD_LOG_RPCS.clear()
+    for i, u in enumerate(RPC_ENDPOINTS):
+        if capability[u] == 0:
+            BAD_LOG_RPCS.add(i)
+    if BAD_LOG_RPCS:
+        benched = [rpc_name(RPC_ENDPOINTS[i]) for i in sorted(BAD_LOG_RPCS)]
+        print(f"[preflight] Benched for this run: {benched}", flush=True)
+
     best = capability[RPC_ENDPOINTS[0]]
     print(f"[preflight] Endpoint order is now: "
           f"{[rpc_name(u) for u in RPC_ENDPOINTS]}", flush=True)
@@ -454,6 +517,9 @@ def main():
     global PROGRESS_FILE
     mode = os.environ.get("MODE", "sample").lower()
 
+    for line in _SECRET_REPORT:
+        print(line, flush=True)
+
     best_range = preflight()
     if best_range == 0:
         print("[main] FATAL: no endpoint will serve log queries at any size. "
@@ -461,10 +527,14 @@ def main():
         return 1
 
     latest = rpc_call(lambda w3: w3.eth.block_number)
-    print(f"[main] mode={mode}, latest Base block = {latest:,}", flush=True)
+    # Stay ~1,000 blocks (~30 min) behind the tip: public nodes are often
+    # unreliable about their freshest blocks. The next run picks them up.
+    scan_top = latest - 1_000
+    print(f"[main] mode={mode}, latest Base block = {latest:,}, "
+          f"scanning up to {scan_top:,}", flush=True)
 
     if mode == "sample":
-        from_block = latest - 200_000
+        from_block = scan_top - 200_000
         PROGRESS_FILE = os.path.join(OUT_DIR, "_progress_sample.json")
     else:
         from_block = START_BLOCK
@@ -473,12 +543,12 @@ def main():
                 from_block = json.load(f)["next_block"]
             print(f"[main] resuming from block {from_block:,}", flush=True)
 
-    if from_block > latest:
+    if from_block > scan_top:
         print("[main] Backfill already complete — nothing to do. ✅", flush=True)
         return 0
 
     chunk = min(INITIAL_CHUNK, best_range)
-    processed, unknown, finished = scan_range(from_block, latest, chunk)
+    processed, unknown, finished = scan_range(from_block, scan_top, chunk)
 
     print(f"[main] processed {processed:,} vote events "
           f"({unknown} unrecognised logs).", flush=True)
