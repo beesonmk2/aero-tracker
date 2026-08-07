@@ -1,5 +1,12 @@
 """
-volume_backfill.py  (v1.1)
+volume_backfill.py  (v1.2)
+
+v1.2: The free API's 180-day history limit (HTTP 401 "upgrade to access
+      data beyond 180 days") is now recognized as the natural edge of
+      available history: pagination stops gracefully and keeps everything
+      gathered, with no retry storm. 180 days x every pool is the maximum
+      the free tier allows; the hourly tracker extends the record forward
+      from here.
 
 v1.1: - Pagination fix: keep requesting older pages until the API returns
         an EMPTY page, instead of stopping when a page has fewer candles
@@ -145,6 +152,10 @@ def api_get(path, params):
             return r.json()
         if r.status_code == 404:
             return None  # pool not indexed by GeckoTerminal
+        if r.status_code == 401 and "180 days" in r.text:
+            # The free API's history limit — not an error, just the edge of
+            # what we're allowed to see. Keep everything gathered so far.
+            return "HISTORY_LIMIT"
         if r.status_code == 429:
             print("[api-err] rate limited — pausing 65s", flush=True)
             time.sleep(65)
@@ -170,6 +181,8 @@ def fetch_pool_history(pool):
             {"aggregate": 1, "limit": 1000, "currency": "usd",
              "before_timestamp": before},
         )
+        if data == "HISTORY_LIMIT":
+            break  # free-API history edge reached; keep what we have
         if data is None:
             return (None, None) if not rows else (list(rows.values()), meta)
         if meta is None:
